@@ -27,6 +27,11 @@ try {
 const PARENT_FOLDER_NAME = 'sturgeon spirits all';
 const SUBFOLDER_NAME = 'Sturgeon Recipes Photos';
 
+// HARDCODED FOLDER ID (RECOMMENDED)
+// Get this from your Drive folder URL: drive.google.com/drive/folders/YOUR_FOLDER_ID
+// This is more reliable than searching by name
+const PHOTOS_FOLDER_ID = process.env.PHOTOS_FOLDER_ID || null; // Set this in Render env variables!
+
 // Initialize Google Drive API
 const auth = new google.auth.GoogleAuth({
   credentials: credentials,
@@ -43,19 +48,30 @@ async function getOrCreateFolder(folderName, parentId = null) {
       ? `name='${folderName}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`
       : `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
     
+    console.log(`Searching for folder: ${folderName}${parentId ? ' in parent: ' + parentId : ''}`);
+    console.log(`Query: ${query}`);
+    
     const response = await drive.files.list({
       q: query,
-      fields: 'files(id, name)',
+      fields: 'files(id, name, capabilities)',
       spaces: 'drive'
     });
 
     if (response.data.files.length > 0) {
-      console.log(`Found existing folder: ${folderName}`);
-      return response.data.files[0].id;
+      const folder = response.data.files[0];
+      console.log(`Found existing folder: ${folderName} (ID: ${folder.id})`);
+      
+      // Check if we can write to this folder
+      if (folder.capabilities && folder.capabilities.canAddChildren === false) {
+        throw new Error(`Service account cannot write to folder "${folderName}". Check folder permissions - service account needs "Editor" access.`);
+      }
+      
+      return folder.id;
     }
 
-    // Create folder if it doesn't exist
-    console.log(`Creating folder: ${folderName}`);
+    // Folder doesn't exist - try to create it
+    console.log(`Folder "${folderName}" not found, attempting to create...`);
+    
     const fileMetadata = {
       name: folderName,
       mimeType: 'application/vnd.google-apps.folder',
@@ -66,6 +82,8 @@ async function getOrCreateFolder(folderName, parentId = null) {
       requestBody: fileMetadata,
       fields: 'id'
     });
+
+    console.log(`Created folder: ${folderName} (ID: ${folder.data.id})`);
 
     // Make folder accessible
     await drive.permissions.create({
@@ -78,7 +96,17 @@ async function getOrCreateFolder(folderName, parentId = null) {
 
     return folder.data.id;
   } catch (error) {
-    console.error(`Error with folder ${folderName}:`, error);
+    console.error(`Error with folder ${folderName}:`, error.message);
+    
+    // Provide helpful error messages
+    if (error.message.includes('insufficient permissions')) {
+      throw new Error(`Permission denied: Service account cannot access or create folder "${folderName}". Make sure the folder is shared with the service account as "Editor".`);
+    }
+    
+    if (error.message.includes('storage quota')) {
+      throw new Error(`Storage quota error: Service accounts don't have their own storage. Share the "${folderName}" folder with the service account (sturgeon-recipes-app@sturgeon-recipes.iam.gserviceaccount.com) as "Editor".`);
+    }
+    
     throw error;
   }
 }
@@ -92,9 +120,35 @@ app.post('/api/upload-photo', upload.single('photo'), async (req, res) => {
 
     console.log('Uploading file:', req.file.originalname);
 
-    // Get or create folder structure
-    const parentFolderId = await getOrCreateFolder(PARENT_FOLDER_NAME);
-    const photosFolderId = await getOrCreateFolder(SUBFOLDER_NAME, parentFolderId);
+    // Use hardcoded folder ID if available (recommended approach)
+    let photosFolderId;
+    
+    if (PHOTOS_FOLDER_ID) {
+      console.log('Using hardcoded folder ID:', PHOTOS_FOLDER_ID);
+      photosFolderId = PHOTOS_FOLDER_ID;
+      
+      // Verify we can access this folder
+      try {
+        const folderCheck = await drive.files.get({
+          fileId: PHOTOS_FOLDER_ID,
+          fields: 'id, name, capabilities'
+        });
+        
+        if (folderCheck.data.capabilities && folderCheck.data.capabilities.canAddChildren === false) {
+          throw new Error('Service account cannot write to this folder. Make sure folder is shared with service account as "Editor".');
+        }
+        
+        console.log(`Verified access to folder: ${folderCheck.data.name}`);
+      } catch (error) {
+        console.error('Cannot access folder ID:', PHOTOS_FOLDER_ID);
+        throw new Error(`Cannot access folder. Make sure folder is shared with service account (${credentials.client_email}) as "Editor". Error: ${error.message}`);
+      }
+    } else {
+      // Fallback to searching by name (less reliable)
+      console.log('No hardcoded folder ID, searching by name...');
+      const parentFolderId = await getOrCreateFolder(PARENT_FOLDER_NAME);
+      photosFolderId = await getOrCreateFolder(SUBFOLDER_NAME, parentFolderId);
+    }
 
     // Upload file to Drive
     const fileMetadata = {
@@ -106,6 +160,8 @@ app.post('/api/upload-photo', upload.single('photo'), async (req, res) => {
       mimeType: req.file.mimetype,
       body: fs.createReadStream(req.file.path)
     };
+
+    console.log('Uploading to folder ID:', photosFolderId);
 
     const file = await drive.files.create({
       requestBody: fileMetadata,
